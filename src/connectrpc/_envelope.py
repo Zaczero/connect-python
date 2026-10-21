@@ -27,6 +27,10 @@ _T = TypeVar("_T")
 class EnvelopeReader(Generic[_RES]):
     _next_message_length: int | None
 
+    # A truncated body is the peer's fault. Servers report it as a bad request,
+    # while clients receiving a truncated response report an internal error.
+    _truncated_code = Code.INVALID_ARGUMENT
+
     def __init__(
         self,
         message_class: type[_RES],
@@ -113,12 +117,12 @@ class EnvelopeReader(Generic[_RES]):
             return
         if self._next_message_length is not None:
             raise ConnectError(
-                Code.INVALID_ARGUMENT,
+                self._truncated_code,
                 f"protocol error: promised {self._next_message_length} bytes in enveloped message, got {len(self._buffer) - 5} bytes",
             )
         if self._buffer:
             raise ConnectError(
-                Code.INVALID_ARGUMENT,
+                self._truncated_code,
                 "protocol error: incomplete envelope: unexpected EOF",
             )
 

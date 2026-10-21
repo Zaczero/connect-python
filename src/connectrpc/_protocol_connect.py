@@ -311,6 +311,8 @@ class ConnectClientProtocol:
 
 
 class ConnectEnvelopeReader(EnvelopeReader[RES]):
+    _truncated_code = Code.INTERNAL
+
     def handle_end_message(
         self, prefix_byte: int, message_data: bytes | bytearray, /
     ) -> bool:

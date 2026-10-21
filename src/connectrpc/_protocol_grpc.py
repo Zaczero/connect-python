@@ -337,6 +337,8 @@ class GRPCWebClientProtocol(GRPCClientProtocol):
 
 
 class GRPCEnvelopeReader(EnvelopeReader[RES]):
+    _truncated_code = Code.INTERNAL
+
     def __init__(
         self,
         message_class: type[RES],
