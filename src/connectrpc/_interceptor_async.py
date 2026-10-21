@@ -3,6 +3,7 @@ from __future__ import annotations
 from asyncio import CancelledError
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, runtime_checkable
 
+from ._server_shared import raise_if_deadline_exceeded
 from .code import Code
 from .errors import ConnectError
 
@@ -304,6 +305,7 @@ class MetadataInterceptorsRun:
         the following call to [end][].
         """
         for interceptor in self._interceptors:
+            raise_if_deadline_exceeded(self._ctx)
             token = await interceptor.on_start(self._ctx)
             self._started.append((interceptor, token))
 

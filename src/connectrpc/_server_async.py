@@ -39,6 +39,7 @@ from ._server_shared import (
     EndpointClientStream,
     EndpointServerStream,
     EndpointUnary,
+    raise_if_deadline_exceeded,
 )
 from ._shared import decode_message, decompress
 from .code import Code
@@ -294,7 +295,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         cancelled_error: CancelledError | None = None
         try:
             async with (timeout := asyncio.timeout_at(deadline)):
+                raise_if_deadline_exceeded(ctx)
                 await metadata_run.start()
+                raise_if_deadline_exceeded(ctx)
                 if http_method == "GET":
                     request = await self._read_get_request(
                         endpoint, codec, query_params
@@ -303,7 +306,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     request = await self._read_post_request(
                         endpoint, receive, codec, headers
                     )
+                raise_if_deadline_exceeded(ctx)
                 response_data = await endpoint.function(request, ctx)
+                raise_if_deadline_exceeded(ctx)
         except CancelledError as e:
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
@@ -326,6 +331,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             raise error
         assert response_data is not None  # noqa: S101 # no error means function returned
 
+        raise_if_deadline_exceeded(ctx)
         res_bytes = codec.encode(response_data)
         response_headers: list[tuple[bytes, bytes]] = [
             (
@@ -334,6 +340,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             )
         ]
         res_bytes = compression.compress(res_bytes)
+        raise_if_deadline_exceeded(ctx)
         response_headers.append((b"content-encoding", compression.name().encode()))
         response_headers.append((b"vary", b"Accept-Encoding"))
 
@@ -448,7 +455,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         cancelled_error: CancelledError | None = None
         try:
             async with (timeout := asyncio.timeout_at(deadline)):
+                raise_if_deadline_exceeded(ctx)
                 await metadata_run.start()
+                raise_if_deadline_exceeded(ctx)
                 if not req_compression:
                     raise unknown_compression_error(
                         headers.get(protocol.compression_header_name(), ""),
@@ -468,7 +477,9 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                 match endpoint:
                     case EndpointUnary():
                         request = await _consume_single_request(request_stream)
+                        raise_if_deadline_exceeded(ctx)
                         response = await endpoint.function(request, ctx)
+                        raise_if_deadline_exceeded(ctx)
                         # End the run before sending the response so on_end can still
                         # modify response metadata.
                         if (end_error := await metadata_run.end(None)) is not None:
@@ -476,11 +487,13 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                         response_stream = _yield_single_response(response)
                     case EndpointClientStream():
                         response = await endpoint.function(request_stream, ctx)
+                        raise_if_deadline_exceeded(ctx)
                         if (end_error := await metadata_run.end(None)) is not None:
                             raise end_error
                         response_stream = _yield_single_response(response)
                     case EndpointServerStream():
                         request = await _consume_single_request(request_stream)
+                        raise_if_deadline_exceeded(ctx)
                         response_stream = endpoint.function(request, ctx)
 
                         # The request has been fully consumed; monitor receive() for a
@@ -500,6 +513,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
 
                 try:
                     async for message in response_stream:
+                        raise_if_deadline_exceeded(ctx)
                         if (
                             disconnect_detected is not None
                             and disconnect_detected.is_set()
@@ -514,6 +528,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                             sent_headers = True
 
                         body = writer.write(message)
+                        raise_if_deadline_exceeded(ctx)
                         await send(
                             {
                                 "type": "http.response.body",
@@ -521,6 +536,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                                 "more_body": True,
                             }
                         )
+                        raise_if_deadline_exceeded(ctx)
                 finally:
                     # Cancel the monitor first so a throwing generator finally-block
                     # doesn't leak the task.
@@ -533,6 +549,7 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     aclose = getattr(response_stream, "aclose", None)
                     if aclose is not None:
                         await aclose()
+                raise_if_deadline_exceeded(ctx)
         except CancelledError as e:
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
@@ -549,6 +566,12 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
             # End the run before ending the response so on_end can still modify
             # response trailers. This is a no-op if the run already ended.
             error = await metadata_run.end(error)
+            if (
+                error is None
+                and (remaining := ctx.timeout_ms) is not None
+                and remaining <= 0
+            ):
+                error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
             end_message = writer.end(
                 ctx.response_trailers,
                 ConnectWireError.from_exception(error) if error else None,

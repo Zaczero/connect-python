@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, TypeVar
 
+from .code import Code
+from .errors import ConnectError
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
@@ -16,6 +19,11 @@ U = TypeVar("U")
 
 DEFAULT_READ_MAX_BYTES = 1024 * 1024 * 4  # 4 MB
 """The default maximum size of a request message (4MB)."""
+
+
+def raise_if_deadline_exceeded(ctx: RequestContext) -> None:
+    if (remaining := ctx.timeout_ms) is not None and remaining <= 0:
+        raise ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
