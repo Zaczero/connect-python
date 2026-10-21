@@ -486,10 +486,12 @@ async def test_metadata_interceptor_ordering_async() -> None:
         pytest.param("MakeVariousHats", True, id="bidi_stream"),
     ],
 )
+@pytest.mark.parametrize("on_end_raises", [False, True], ids=["end-ok", "end-raises"])
 async def test_non_hoisted_metadata_interceptor_reports_cancellation(
-    method: str, streaming: bool
+    method: str, streaming: bool, on_end_raises: bool
 ) -> None:
     entered = asyncio.Event()
+    cleanup_error = ValueError("metadata cleanup failed")
     request_body = b'{"inches":10}'
     if streaming:
         request_body = b"\x00" + len(request_body).to_bytes(4, "big") + request_body
@@ -540,6 +542,8 @@ async def test_non_hoisted_metadata_interceptor_reports_cancellation(
 
         async def on_end(self, _token, _ctx, error):
             self.errors.append(error)
+            if on_end_raises:
+                raise cleanup_error
 
     observer = CancellationObserver()
     app = HaberdasherASGIApplication(
@@ -551,13 +555,18 @@ async def test_non_hoisted_metadata_interceptor_reports_cancellation(
     try:
         await asyncio.wait_for(entered.wait(), timeout=5.0)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        if on_end_raises:
+            with pytest.raises(ValueError, match="metadata cleanup failed") as exc_info:
+                await task
+            assert exc_info.value is cleanup_error
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
     finally:
         if not task.done():
             task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     assert len(observer.errors) == 1
     error = observer.errors[0]
@@ -678,6 +687,7 @@ def test_metadata_interceptor_ordering_sync() -> None:
 async def test_metadata_interceptor_closes_stream_async(method: str) -> None:
     """An early end of the response closes the handler's stream."""
     events: list[str] = []
+    attempts = []
 
     class EventMetadataInterceptor:
         async def on_start(self, ctx):  # noqa: ARG002
@@ -733,6 +743,7 @@ async def test_metadata_interceptor_closes_stream_async(method: str) -> None:
         return {"type": "http.disconnect"}
 
     async def send(message) -> None:
+        attempts.append(message["type"])
         if message["type"] == "http.response.body" and message["more_body"]:
             disconnected.set()
             if method == "MakeVariousHats":
@@ -740,7 +751,13 @@ async def test_metadata_interceptor_closes_stream_async(method: str) -> None:
                 # learns of it from a failed send.
                 raise ConnectError(Code.CANCELED, "Client disconnected")
 
-    await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
+    if method == "MakeVariousHats":
+        with pytest.raises(ConnectError, match="Client disconnected") as exc_info:
+            await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
+        assert exc_info.value.code == Code.CANCELED
+        assert attempts == ["http.response.start", "http.response.body"]
+    else:
+        await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
 
     assert events == ["metadata start", "handler closed", "metadata end"]
 

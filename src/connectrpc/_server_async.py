@@ -8,6 +8,7 @@ import inspect
 from abc import ABC, abstractmethod
 from asyncio import CancelledError, Event, create_task, get_event_loop, sleep
 from dataclasses import replace
+from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 from urllib.parse import parse_qs
@@ -57,7 +58,13 @@ if TYPE_CHECKING:
         Sequence,
     )
 
-    from asgiref.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope, Scope
+    from asgiref.typing import (
+        ASGIReceiveCallable,
+        ASGISendCallable,
+        ASGISendEvent,
+        HTTPScope,
+        Scope,
+    )
 
     from . import _server_shared
     from .compression import Compression
@@ -83,6 +90,62 @@ Endpoint = (
     | EndpointServerStream[_REQ, _RES]
     | EndpointUnary[_REQ, _RES]
 )
+
+
+class _ResponseState(Enum):
+    NOT_STARTED = auto()
+    BODY = auto()
+    BODY_WITH_TRAILERS = auto()
+    BODY_DONE_TRAILERS_PENDING = auto()
+    COMPLETE = auto()
+    FAILED = auto()
+
+
+class _ASGIResponse:
+    """Own accepted response progress and stop emission after an uncertain send."""
+
+    def __init__(self, send: ASGISendCallable) -> None:
+        self._send = send
+        self.state = _ResponseState.NOT_STARTED
+
+    async def send(self, message: ASGISendEvent) -> None:
+        match message["type"]:
+            case "http.response.start":
+                assert self.state is _ResponseState.NOT_STARTED  # noqa: S101
+                next_state = (
+                    _ResponseState.BODY_WITH_TRAILERS
+                    if message.get("trailers", False)
+                    else _ResponseState.BODY
+                )
+            case "http.response.body":
+                assert self.state in (  # noqa: S101
+                    _ResponseState.BODY,
+                    _ResponseState.BODY_WITH_TRAILERS,
+                )
+                next_state = self.state
+                if not message.get("more_body", False):
+                    next_state = (
+                        _ResponseState.BODY_DONE_TRAILERS_PENDING
+                        if self.state is _ResponseState.BODY_WITH_TRAILERS
+                        else _ResponseState.COMPLETE
+                    )
+            case "http.response.trailers":
+                assert self.state is _ResponseState.BODY_DONE_TRAILERS_PENDING  # noqa: S101
+                next_state = (
+                    self.state
+                    if message.get("more_trailers", False)
+                    else _ResponseState.COMPLETE
+                )
+            case _:
+                msg = "Unexpected ASGI response event"
+                raise AssertionError(msg)
+        try:
+            await self._send(message)
+        except BaseException:
+            # A send can fail before or after accepting the event.
+            self.state = _ResponseState.FAILED
+            raise
+        self.state = next_state
 
 
 class ConnectASGIApplication(ABC, Generic[_SVC]):
@@ -241,32 +304,24 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     [("Accept-Post", "application/json, application/proto")],
                 )
 
-            if is_unary and isinstance(protocol, ConnectServerProtocol):
-                try:
-                    return await self._handle_unary_connect(
-                        http_method,
-                        headers,
-                        codec,
-                        query_params,
-                        endpoint,
-                        receive,
-                        send,
-                        deadline,
-                        ctx,
-                    )
-                except CancelledError:
-                    await self._handle_error(
-                        ConnectError(Code.CANCELED, "Request was cancelled"),
-                        ctx,
-                        protocol,
-                        send,
-                    )
-                    raise
         except Exception as e:
             await self._handle_error(e, ctx, protocol, send)
             if not isinstance(e, (ConnectError, HTTPError)):
                 raise
             return None
+
+        if is_unary and isinstance(protocol, ConnectServerProtocol):
+            return await self._handle_unary_connect(
+                http_method,
+                headers,
+                codec,
+                query_params,
+                endpoint,
+                receive,
+                send,
+                deadline,
+                ctx,
+            )
 
         # Streams have their own error handling so move out of the try block.
         return await self._handle_stream(
@@ -289,8 +344,8 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         compression = negotiate_compression(accept_encoding, self._compressions)
 
         metadata_run = MetadataInterceptorsRun(self._metadata_interceptors, ctx)
-        response_data: _RES | None = None
         error: Exception | None = None
+        response = _ASGIResponse(send)
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
@@ -309,6 +364,42 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                 raise_if_deadline_exceeded(ctx)
                 response_data = await endpoint.function(request, ctx)
                 raise_if_deadline_exceeded(ctx)
+                # on_end can still modify response metadata before it is encoded.
+                if (end_error := await metadata_run.end(None)) is not None:
+                    raise end_error
+                raise_if_deadline_exceeded(ctx)
+
+                res_bytes = codec.encode(response_data)
+                response_headers: list[tuple[bytes, bytes]] = [
+                    (
+                        b"content-type",
+                        f"{CONNECT_UNARY_CONTENT_TYPE_PREFIX}{codec.name()}".encode(),
+                    )
+                ]
+                res_bytes = compression.compress(res_bytes)
+                response_headers.append(
+                    (b"content-encoding", compression.name().encode())
+                )
+                response_headers.append((b"vary", b"Accept-Encoding"))
+                _add_context_headers(response_headers, ctx)
+                raise_if_deadline_exceeded(ctx)
+
+                await response.send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": response_headers,
+                        "trailers": False,
+                    }
+                )
+                raise_if_deadline_exceeded(ctx)
+                await response.send(
+                    {
+                        "type": "http.response.body",
+                        "body": res_bytes,
+                        "more_body": False,
+                    }
+                )
         except CancelledError as e:
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
@@ -322,41 +413,20 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         except Exception as e:  # noqa: BLE001 # re-raised after ending the run
             error = e
         finally:
-            # End the run before sending the response so on_end can still modify
-            # response metadata.
-            error = await metadata_run.end(error)
-        if cancelled_error is not None:
-            raise cancelled_error
+            end_error = await metadata_run.end(error)
+            if response.state is not _ResponseState.FAILED:
+                error = end_error
         if error is not None:
-            raise error
-        assert response_data is not None  # noqa: S101 # no error means function returned
-
-        raise_if_deadline_exceeded(ctx)
-        res_bytes = codec.encode(response_data)
-        response_headers: list[tuple[bytes, bytes]] = [
-            (
-                b"content-type",
-                f"{CONNECT_UNARY_CONTENT_TYPE_PREFIX}{codec.name()}".encode(),
-            )
-        ]
-        res_bytes = compression.compress(res_bytes)
-        raise_if_deadline_exceeded(ctx)
-        response_headers.append((b"content-encoding", compression.name().encode()))
-        response_headers.append((b"vary", b"Accept-Encoding"))
-
-        _add_context_headers(response_headers, ctx)
-
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": response_headers,
-                "trailers": False,
-            }
-        )
-        await send(
-            {"type": "http.response.body", "body": res_bytes, "more_body": False}
-        )
+            if response.state is _ResponseState.NOT_STARTED:
+                await self._handle_error(error, ctx, None, response.send)
+            else:
+                if cancelled_error is not None:
+                    raise cancelled_error
+                raise error
+            if cancelled_error is not None:
+                raise cancelled_error
+            if not isinstance(error, (ConnectError, HTTPError)):
+                raise error
 
     async def _read_get_request(
         self,
@@ -450,7 +520,48 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
 
         metadata_run = MetadataInterceptorsRun(self._metadata_interceptors, ctx)
         error: Exception | None = None
-        sent_headers = False
+        response = _ASGIResponse(send)
+
+        async def finish_response(error: Exception | None) -> None:
+            if error is None:
+                raise_if_deadline_exceeded(ctx)
+            if response.state is _ResponseState.NOT_STARTED:
+                await _send_stream_response_headers(
+                    response.send, protocol, codec, resp_compression.name(), ctx
+                )
+                if error is None:
+                    raise_if_deadline_exceeded(ctx)
+            end_message = writer.end(
+                ctx.response_trailers,
+                ConnectWireError.from_exception(error) if error else None,
+            )
+            if error is None:
+                raise_if_deadline_exceeded(ctx)
+            if isinstance(end_message, bytes):
+                await response.send(
+                    {
+                        "type": "http.response.body",
+                        "body": end_message,
+                        "more_body": False,
+                    }
+                )
+            else:
+                if response.state is _ResponseState.BODY_WITH_TRAILERS:
+                    await response.send(
+                        {"type": "http.response.body", "body": b"", "more_body": False}
+                    )
+                    if error is None:
+                        raise_if_deadline_exceeded(ctx)
+                await response.send(
+                    {
+                        "type": "http.response.trailers",
+                        "headers": [
+                            (k.encode(), v.encode()) for k, v in end_message.allitems()
+                        ],
+                        "more_trailers": False,
+                    }
+                )
+
         # Important to propagate cancellation to app servers as-is
         cancelled_error: CancelledError | None = None
         try:
@@ -478,19 +589,19 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                     case EndpointUnary():
                         request = await _consume_single_request(request_stream)
                         raise_if_deadline_exceeded(ctx)
-                        response = await endpoint.function(request, ctx)
+                        response_data = await endpoint.function(request, ctx)
                         raise_if_deadline_exceeded(ctx)
                         # End the run before sending the response so on_end can still
                         # modify response metadata.
                         if (end_error := await metadata_run.end(None)) is not None:
                             raise end_error
-                        response_stream = _yield_single_response(response)
+                        response_stream = _yield_single_response(response_data)
                     case EndpointClientStream():
-                        response = await endpoint.function(request_stream, ctx)
+                        response_data = await endpoint.function(request_stream, ctx)
                         raise_if_deadline_exceeded(ctx)
                         if (end_error := await metadata_run.end(None)) is not None:
                             raise end_error
-                        response_stream = _yield_single_response(response)
+                        response_stream = _yield_single_response(response_data)
                     case EndpointServerStream():
                         request = await _consume_single_request(request_stream)
                         raise_if_deadline_exceeded(ctx)
@@ -521,15 +632,19 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                             raise ConnectError(Code.CANCELED, "Client disconnected")
                         # Don't send headers until the first message to allow logic a chance to add
                         # response headers.
-                        if not sent_headers:
+                        if response.state is _ResponseState.NOT_STARTED:
                             await _send_stream_response_headers(
-                                send, protocol, codec, resp_compression.name(), ctx
+                                response.send,
+                                protocol,
+                                codec,
+                                resp_compression.name(),
+                                ctx,
                             )
-                            sent_headers = True
+                            raise_if_deadline_exceeded(ctx)
 
                         body = writer.write(message)
                         raise_if_deadline_exceeded(ctx)
-                        await send(
+                        await response.send(
                             {
                                 "type": "http.response.body",
                                 "body": body,
@@ -538,18 +653,22 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
                         )
                         raise_if_deadline_exceeded(ctx)
                 finally:
-                    # Cancel the monitor first so a throwing generator finally-block
-                    # doesn't leak the task.
-                    if monitor_task is not None:
-                        monitor_task.cancel()
-                        with contextlib.suppress(CancelledError):
-                            await monitor_task
-                    # Explicitly close the stream so that any generator finally-blocks
-                    # run promptly (Python defers async-generator cleanup to GC otherwise).
-                    aclose = getattr(response_stream, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
+                    try:
+                        # Stop the monitor before closing the response iterator.
+                        if monitor_task is not None:
+                            monitor_task.cancel()
+                            with contextlib.suppress(CancelledError):
+                                await monitor_task
+                        aclose = getattr(response_stream, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                    except Exception:  # Preserve an uncertain send's original failure.
+                        if response.state is not _ResponseState.FAILED:
+                            raise
                 raise_if_deadline_exceeded(ctx)
+                if (end_error := await metadata_run.end(None)) is not None:
+                    raise end_error
+                await finish_response(None)
         except CancelledError as e:
             cancelled_error = e
             error = ConnectError(Code.CANCELED, "Request was cancelled")
@@ -565,47 +684,21 @@ class ConnectASGIApplication(ABC, Generic[_SVC]):
         finally:
             # End the run before ending the response so on_end can still modify
             # response trailers. This is a no-op if the run already ended.
-            error = await metadata_run.end(error)
-            if (
-                error is None
-                and (remaining := ctx.timeout_ms) is not None
-                and remaining <= 0
-            ):
-                error = ConnectError(Code.DEADLINE_EXCEEDED, "Request timed out")
-            end_message = writer.end(
-                ctx.response_trailers,
-                ConnectWireError.from_exception(error) if error else None,
-            )
-            if not sent_headers:
-                # Exception before any response message is returned
-                await _send_stream_response_headers(
-                    send, protocol, codec, resp_compression.name(), ctx
-                )
-            if isinstance(end_message, bytes):
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": end_message,
-                        "more_body": False,
-                    }
-                )
-            else:
-                await send(
-                    {"type": "http.response.body", "body": b"", "more_body": False}
-                )
-                await send(
-                    {
-                        "type": "http.response.trailers",
-                        "headers": [
-                            (k.encode(), v.encode()) for k, v in end_message.allitems()
-                        ],
-                        "more_trailers": False,
-                    }
-                )
+            end_error = await metadata_run.end(error)
+            if response.state is not _ResponseState.FAILED:
+                error = end_error
+        if response.state is _ResponseState.FAILED:
             if cancelled_error is not None:
-                raise cancelled_error from None
-            if error and not isinstance(error, ConnectError):
-                raise error
+                raise cancelled_error
+            assert error is not None  # noqa: S101 # The send raised.
+            raise error
+        if response.state is _ResponseState.COMPLETE:
+            return
+        await finish_response(error)
+        if cancelled_error is not None:
+            raise cancelled_error from None
+        if error and not isinstance(error, ConnectError):
+            raise error
 
     async def _handle_error(
         self,
