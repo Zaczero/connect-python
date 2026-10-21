@@ -60,19 +60,24 @@ class GRPCServerProtocol:
         if http_method != "POST":
             raise HTTPError(HTTPStatus.METHOD_NOT_ALLOWED, [("allow", "POST")])
 
-        timeout_header = headers.get(GRPC_HEADER_TIMEOUT)
-        timeout_ms = _parse_timeout(timeout_header) if timeout_header else None
+        timeouts = headers.getall(GRPC_HEADER_TIMEOUT)
+        if len(timeouts) > 1:
+            raise ConnectError(
+                Code.INVALID_ARGUMENT, "protocol error: multiple grpc-timeout headers"
+            )
+        timeout_ns = _parse_timeout(timeouts[0]) if timeouts else None
 
         server_address = host_to_server_address(headers.get("host"), http_scheme)
 
-        return RequestContext(
+        ctx = RequestContext(
             method=method,
             http_method=http_method,
             request_headers=headers,
-            timeout_ms=timeout_ms,
             server_address=server_address,
             client_address=client_address,
         )
+        ctx._set_timeout_ns(timeout_ns)
+        return ctx
 
     def create_envelope_writer(
         self, codec: Codec[RES, Any], compression: Compression | None
@@ -138,39 +143,41 @@ class GRPCWebServerProtocol(GRPCServerProtocol):
 
 
 def _parse_timeout(timeout: str) -> int:
-    # We normalize to int milliseconds matching connect's timeout header.
-    value_to_ms = _lookup_timeout_unit(timeout[-1])
+    if len(timeout) < 2:
+        raise ConnectError(
+            Code.INVALID_ARGUMENT, f"protocol error: invalid timeout '{timeout}'"
+        )
+
+    value_to_ns = _lookup_timeout_unit(timeout[-1])
     digits = timeout[:-1]
-    # int() also accepts a sign, whitespace, and underscores.
     if not (digits.isascii() and digits.isdigit()):
         raise ConnectError(
             Code.INVALID_ARGUMENT, f"protocol error: invalid timeout '{timeout}'"
         )
-    value = int(digits)
 
-    # timeout must be ASCII string of at most 8 digits
-    if value > 99999999:
+    # The gRPC timeout grammar allows at most eight digits, including leading zeroes.
+    if len(digits) > 8:
         raise ConnectError(
             Code.INVALID_ARGUMENT, f"protocol error: timeout '{timeout}' is too long"
         )
 
-    return int(value * value_to_ms)
+    return int(digits) * value_to_ns
 
 
-def _lookup_timeout_unit(unit: str) -> float:
+def _lookup_timeout_unit(unit: str) -> int:
     match unit:
         case "H":
-            return 60 * 60 * 1000
+            return 60 * 60 * 1_000_000_000
         case "M":
-            return 60 * 1000
+            return 60 * 1_000_000_000
         case "S":
-            return 1 * 1000
+            return 1_000_000_000
         case "m":
-            return 1
+            return 1_000_000
         case "u":
-            return 1 / 1000
+            return 1_000
         case "n":
-            return 1 / 1000 / 1000
+            return 1
         case _:
             raise ConnectError(
                 Code.INVALID_ARGUMENT,

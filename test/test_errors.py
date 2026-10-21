@@ -40,6 +40,8 @@ from .connectrpc.example.haberdasher_pb import Hat, Size
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
+    from asgiref.typing import HTTPScope
+
     from connectrpc.request import RequestContext
 
 _errors = [
@@ -422,6 +424,67 @@ async def test_client_errors(
 
     assert response.status == response_status
     assert response.headers == response_headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", [b"application/grpc", b"application/grpc-web"])
+@pytest.mark.parametrize(
+    "timeout_headers",
+    [
+        pytest.param([(b"grpc-timeout", b"")], id="empty"),
+        pytest.param([(b"grpc-timeout", b"000000001m")], id="leading-zero-overlong"),
+        pytest.param(
+            [(b"grpc-timeout", b"1m"), (b"grpc-timeout", b"2m")], id="duplicates"
+        ),
+        pytest.param([(b"grpc-timeout", b"1m,2m")], id="comma-combined"),
+    ],
+)
+async def test_invalid_grpc_timeout_headers_rejected_before_read(
+    content_type: bytes, timeout_headers: list[tuple[bytes, bytes]]
+) -> None:
+    class ValidHaberdasher(Haberdasher):
+        async def make_hat(self, _request, _ctx):
+            return Hat()
+
+    app = HaberdasherASGIApplication(ValidHaberdasher())
+    path = "/connectrpc.example.Haberdasher/MakeHat"
+    request = Size(inches=10).to_binary()
+    body = b"\x00" + len(request).to_bytes(4, "big") + request
+    scope: HTTPScope = {
+        "type": "http",
+        "asgi": {"spec_version": "2.0", "version": "3.0"},
+        "http_version": "2",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", content_type), *timeout_headers],
+        "client": None,
+        "server": None,
+        "extensions": {"http.response.trailers": {}},
+    }
+    receive_calls = 0
+    events = []
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        events.append(message)
+
+    await app(scope, receive, send)
+
+    response_start = next(
+        event for event in events if event["type"] == "http.response.start"
+    )
+    response_headers = dict(response_start["headers"])
+    assert response_start["status"] == HTTPStatus.OK
+    assert receive_calls == 0
+    assert response_headers[b"grpc-status"] == b"3"
 
 
 @pytest.mark.parametrize(
