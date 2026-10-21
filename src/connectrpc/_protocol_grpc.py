@@ -337,7 +337,7 @@ class GRPCWebClientProtocol(GRPCClientProtocol):
 
 
 class GRPCEnvelopeReader(EnvelopeReader[RES]):
-    _truncated_code = Code.INTERNAL
+    _protocol_error_code = Code.INTERNAL
 
     def __init__(
         self,
@@ -404,6 +404,8 @@ class GRPCEnvelopeReader(EnvelopeReader[RES]):
 
 
 class GRPCWebEnvelopeReader(GRPCEnvelopeReader):
+    _flags_mask = 0b10000001
+
     def __init__(
         self,
         message_class: type[RES],
