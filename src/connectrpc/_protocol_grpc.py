@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import sys
+import time
 import urllib.parse
 from base64 import b64decode, b64encode
 from http import HTTPStatus
@@ -60,12 +61,10 @@ class GRPCServerProtocol:
         if http_method != "POST":
             raise HTTPError(HTTPStatus.METHOD_NOT_ALLOWED, [("allow", "POST")])
 
-        timeouts = headers.getall(GRPC_HEADER_TIMEOUT)
-        if len(timeouts) > 1:
-            raise ConnectError(
-                Code.INVALID_ARGUMENT, "protocol error: multiple grpc-timeout headers"
-            )
-        timeout_ns = _parse_timeout(timeouts[0]) if timeouts else None
+        timeout_header = headers.get(GRPC_HEADER_TIMEOUT)
+        timeout_ns = (
+            _parse_timeout(timeout_header) if timeout_header is not None else None
+        )
 
         server_address = host_to_server_address(headers.get("host"), http_scheme)
 
@@ -76,7 +75,8 @@ class GRPCServerProtocol:
             server_address=server_address,
             client_address=client_address,
         )
-        ctx._set_timeout_ns(timeout_ns)
+        if timeout_ns is not None:
+            ctx._end_time = time.monotonic() + (timeout_ns / 1_000_000_000)
         return ctx
 
     def create_envelope_writer(

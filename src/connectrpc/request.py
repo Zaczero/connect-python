@@ -45,13 +45,10 @@ class RequestContext(Generic[REQ, RES]):
         self._server_address = server_address
         self._client_address = client_address
 
-        self._set_timeout_ns(None if timeout_ms is None else timeout_ms * 1_000_000)
-
-    def _set_timeout_ns(self, timeout_ns: int | None) -> None:
-        if timeout_ns is None:
+        if timeout_ms is None:
             self._end_time = None
         else:
-            self._end_time = time.monotonic() + (timeout_ns / 1_000_000_000)
+            self._end_time = time.monotonic() + (timeout_ms / 1000.0)
 
     @property
     def method(self) -> MethodInfo[REQ, RES]:

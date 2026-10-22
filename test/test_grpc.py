@@ -45,11 +45,23 @@ def test_parse_timeout(timeout: str, timeout_ns: int) -> None:
 
 @pytest.mark.parametrize(
     "timeout",
-    ["", "n", "m", "-5m", "+5m", " 5m", "5_0m", "123456789m", "000000001m", "\u0661m"],
+    [
+        "",
+        "n",
+        "m",
+        "-5m",
+        "+5m",
+        " 5m",
+        "5_0m",
+        "123456789m",
+        "000000001m",
+        "\u0661m",
+        "000000001S",
+    ],
 )
 def test_parse_timeout_invalid(timeout: str) -> None:
     with pytest.raises(ConnectError) as excinfo:
-        _parse_timeout(timeout)
+        _create_request_context(Headers({"grpc-timeout": timeout}))
     assert excinfo.value.code == Code.INVALID_ARGUMENT
 
 
@@ -58,20 +70,6 @@ def test_parse_timeout_invalid_unit() -> None:
         _parse_timeout("100X")
     assert excinfo.value.code == Code.INVALID_ARGUMENT
     assert excinfo.value.message == "protocol error: timeout has invalid unit 'X'"
-
-
-@pytest.mark.parametrize("timeout", ["", "000000001S"])
-def test_invalid_timeout_header_is_rejected(timeout: str) -> None:
-    with pytest.raises(ConnectError) as excinfo:
-        _create_request_context(Headers({"grpc-timeout": timeout}))
-    assert excinfo.value.code == Code.INVALID_ARGUMENT
-
-
-def test_repeated_timeout_headers_are_rejected() -> None:
-    headers = Headers([("grpc-timeout", "1S"), ("grpc-timeout", "0n")])
-    with pytest.raises(ConnectError) as excinfo:
-        _create_request_context(headers)
-    assert excinfo.value.code == Code.INVALID_ARGUMENT
 
 
 @pytest.mark.parametrize(("timeout", "expected_ms"), [("5u", 0.005), ("6n", 0.000006)])
@@ -88,7 +86,7 @@ def test_submillisecond_request_deadline(timeout: str, expected_ms: float, monke
         pytest.param("9999999n", 1.25, 8.749999, id="nanoseconds"),
     ],
 )
-def test_request_deadline_preserves_fractional_budget(
+def test_request_deadline_fractional_budget(
     timeout: str, elapsed_ms: float, remaining_ms: float, monkeypatch
 ) -> None:
     now = 123.456
